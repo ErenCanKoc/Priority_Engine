@@ -1,0 +1,6 @@
+pandas
+numpy
+serpapi
+openai
+python-dotenv
+requests
