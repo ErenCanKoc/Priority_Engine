@@ -64,32 +64,45 @@ def run_engine():
     df.columns = df.columns.str.lower().str.strip()
 
     # Expect these headers in your Looker export (case-insensitive):
-   df = df.rename(columns={
-    "query": "keyword",
-    "landing page": "url",
+    df = df.rename(
+        columns={
+            "query": "keyword",
+            "landing page": "url",
+            "url clicks": "clicks_last",
+            "clicks percent change": "clicks_pct",
+            "impressions": "impr_last",
+            "impression percent change": "impr_pct",
+            "url ctr": "ctr_last",
+            "ctr percent change": "ctr_pct",
+            "avg. position": "pos",
+            "avg. position percent change": "pos_pct",
+        }
+    )
 
-    "url clicks": "clicks_last",
-    "clicks percent change": "clicks_pct",
+    expected_columns = [
+        "keyword",
+        "url",
+        "clicks_last",
+        "clicks_pct",
+        "impr_last",
+        "impr_pct",
+        "ctr_last",
+        "ctr_pct",
+        "pos",
+        "pos_pct",
+    ]
+    for column in expected_columns:
+        if column not in df.columns:
+            df[column] = np.nan
 
-    "impressions": "impr_last",
-    "impression percent change": "impr_pct",
-
-    "url ctr": "ctr_last",
-    "ctr percent change": "ctr_pct",
-
-    "avg. position": "pos",
-    "avg. position percent change": "pos_pct",
-})
     # Parse
+    for c in ["clicks_last", "impr_last", "pos", "ctr_last"]:
+        if c in df.columns:
+            df[c] = df[c].apply(_parse_number)
 
-for c in ["clicks_last", "impr_last", "pos", "ctr_last"]:
-    if c in df.columns:
-        df[c] = df[c].apply(_parse_number)
-        
-for c in ["clicks_pct", "impr_pct", "ctr_pct", "pos_pct"]:
-    if c in df.columns:
-        df[c] = df[c].apply(_parse_pct)
-
+    for c in ["clicks_pct", "impr_pct", "ctr_pct", "pos_pct"]:
+        if c in df.columns:
+            df[c] = df[c].apply(_parse_pct)
 
     # Data quality
     def data_quality(r):
