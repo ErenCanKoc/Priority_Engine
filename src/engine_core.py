@@ -64,22 +64,32 @@ def run_engine():
     df.columns = df.columns.str.lower().str.strip()
 
     # Expect these headers in your Looker export (case-insensitive):
-    # Query, Landing Page, Url Clicks, Clicks Percent Change, Impressions, Impression Percent Change, Avg. Position
-    df = df.rename(columns={
-        "query": "keyword",
-        "landing page": "url",
-        "url clicks": "clicks_last",
-        "clicks percent change": "clicks_pct",
-        "impressions": "impr_last",
-        "impression percent change": "impr_pct",
-        "avg. position": "pos",
-    })
+   df = df.rename(columns={
+    "query": "keyword",
+    "landing page": "url",
 
+    "url clicks": "clicks_last",
+    "clicks percent change": "clicks_pct",
+
+    "impressions": "impr_last",
+    "impression percent change": "impr_pct",
+
+    "url ctr": "ctr_last",
+    "ctr percent change": "ctr_pct",
+
+    "avg. position": "pos",
+    "avg. position percent change": "pos_pct",
+})
     # Parse
-    for c in ["clicks_last", "impr_last", "pos"]:
+
+for c in ["clicks_last", "impr_last", "pos", "ctr_last"]:
+    if c in df.columns:
         df[c] = df[c].apply(_parse_number)
-    df["clicks_pct"] = df["clicks_pct"].apply(_parse_pct)
-    df["impr_pct"] = df["impr_pct"].apply(_parse_pct)
+        
+for c in ["clicks_pct", "impr_pct", "ctr_pct", "pos_pct"]:
+    if c in df.columns:
+        df[c] = df[c].apply(_parse_pct)
+
 
     # Data quality
     def data_quality(r):
@@ -159,3 +169,4 @@ def run_engine():
     out_path = os.path.join(OUTPUT_DIR, "engine_output.csv")
     df.to_csv(out_path, index=False)
     print(f"✔ Engine output saved → {out_path}")
+
