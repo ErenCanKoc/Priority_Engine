@@ -64,18 +64,20 @@ def run_engine():
     df.columns = df.columns.str.lower().str.strip()
 
     # Expect these headers in your Looker export (case-insensitive):
-    df = df.rename(columns={
-        "query": "keyword",
-        "landing page": "url",
-        "url clicks": "clicks_last",
-        "clicks percent change": "clicks_pct",
-        "impressions": "impr_last",
-        "impression percent change": "impr_pct",
-        "url ctr": "ctr_last",
-        "ctr percent change": "ctr_pct",
-        "avg. position": "pos",
-        "avg. position percent change": "pos_pct",
-    })
+    df = df.rename(
+        columns={
+            "query": "keyword",
+            "landing page": "url",
+            "url clicks": "clicks_last",
+            "clicks percent change": "clicks_pct",
+            "impressions": "impr_last",
+            "impression percent change": "impr_pct",
+            "url ctr": "ctr_last",
+            "ctr percent change": "ctr_pct",
+            "avg. position": "pos",
+            "avg. position percent change": "pos_pct",
+        }
+    )
 
     expected_columns = [
         "keyword",
@@ -94,7 +96,6 @@ def run_engine():
             df[column] = np.nan
 
     # Parse
-
     for c in ["clicks_last", "impr_last", "pos", "ctr_last"]:
         if c in df.columns:
             df[c] = df[c].apply(_parse_number)
