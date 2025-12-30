@@ -8,7 +8,7 @@ from openai import OpenAI
 from config import OUTPUT_DIR, OPENAI_API_KEY
 from llm_prompts import DEEPDIVE_SYSTEM_PROMPT
 
-MODEL_STAGE_2 = "gpt-4.1-mini"
+MODEL_STAGE_2 = "gpt-4o-mini"
 TEMPERATURE = 0.2
 SLEEP = 0.9
 
@@ -43,7 +43,9 @@ Traffic gap (clicks): {r.get('traffic_gap','')}
 
 LLM Stage 1 verdict: {r.get('llm_stage_1_verdict','')}
 LLM Stage 1 confidence: {r.get('llm_stage_1_confidence','')}
-LLM Stage 1 reasoning: {r.get('llm_stage_1_reasoning','')}
+LLM Stage 1 problem: {r.get('llm_stage_1_problem','')}
+LLM Stage 1 cause: {r.get('llm_stage_1_cause','')}
+LLM Stage 1 opportunity: {r.get('llm_stage_1_opportunity','')}
 
 SERP status: {r.get('serp_status','')}
 SERP features: {r.get('serp_features','')}
@@ -54,19 +56,23 @@ SERP error: {r.get('serp_error','')}
 
 
 # -----------------------
-# Main runner (V2)
+# Main runner (V3)
 # -----------------------
 def run_llm_stage_2():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     in_path = os.path.join(OUTPUT_DIR, "llm_stage_1_output.csv")
     df = pd.read_csv(in_path)
 
-    # Guarantee output columns
+    # Guarantee output columns (structured reasoning + actions)
     for c in [
         "llm_stage_2_status",
         "llm_final_verdict",
         "llm_final_confidence",
-        "llm_final_reasoning",
+        "llm_final_problem",
+        "llm_final_cause",
+        "llm_final_opportunity",
+        "llm_final_evidence",
+        "llm_final_reasoning_raw",  # backup: full reasoning as JSON string
         "llm_final_actions",
         "llm_final_risk_flags",
     ]:
@@ -77,7 +83,11 @@ def run_llm_stage_2():
     df["llm_stage_2_status"] = "skipped"
     df["llm_final_verdict"] = "monitor"
     df["llm_final_confidence"] = "low"
-    df["llm_final_reasoning"] = ""
+    df["llm_final_problem"] = ""
+    df["llm_final_cause"] = ""
+    df["llm_final_opportunity"] = ""
+    df["llm_final_evidence"] = ""
+    df["llm_final_reasoning_raw"] = ""
     df["llm_final_actions"] = ""
     df["llm_final_risk_flags"] = ""
 
@@ -106,16 +116,36 @@ def run_llm_stage_2():
                 df.loc[idx, "llm_stage_2_status"] = "error"
                 df.loc[idx, "llm_final_verdict"] = "monitor"
                 df.loc[idx, "llm_final_confidence"] = "low"
-                df.loc[idx, "llm_final_reasoning"] = raw[:1000]
+                df.loc[idx, "llm_final_reasoning_raw"] = raw[:1000]
                 df.loc[idx, "llm_final_risk_flags"] = "json_parse_failed"
                 time.sleep(SLEEP)
                 continue
 
             verdict = parsed.get("verdict", "monitor")
             confidence = parsed.get("confidence", "low")
-            reasoning = parsed.get("reasoning", "")
+            reasoning = parsed.get("reasoning", {})
             actions = parsed.get("recommended_actions", [])
             risk_flags = parsed.get("risk_flags", [])
+
+            # Parse structured reasoning (with fallbacks)
+            if isinstance(reasoning, dict):
+                problem = reasoning.get("problem", "")
+                cause = reasoning.get("cause", "")
+                opportunity = reasoning.get("opportunity", "")
+                evidence = reasoning.get("evidence", "")
+            elif isinstance(reasoning, str):
+                # Fallback: LLM returned string instead of dict
+                problem = reasoning[:200]
+                cause = ""
+                opportunity = ""
+                evidence = ""
+                risk_flags = list(set(risk_flags + ["reasoning_format_error"]))
+            else:
+                problem = ""
+                cause = ""
+                opportunity = ""
+                evidence = ""
+                risk_flags = list(set(risk_flags + ["reasoning_missing"]))
 
             # Enforce risk flags based on upstream context
             if r.get("serp_status") != "ok":
@@ -124,11 +154,24 @@ def run_llm_stage_2():
             if r.get("llm_stage_1_confidence") == "low":
                 risk_flags = list(set(risk_flags + ["low_upstream_confidence"]))
 
+            # Validate actions specificity (basic check)
+            generic_phrases = ["improve content", "optimize title", "build links", "add keywords"]
+            if actions:
+                for action in actions:
+                    if any(phrase in action.lower() for phrase in generic_phrases):
+                        if len(action.split()) < 8:  # if action is too short, likely generic
+                            risk_flags = list(set(risk_flags + ["generic_actions"]))
+                            break
+
             df.loc[idx, "llm_stage_2_status"] = "ok"
             df.loc[idx, "llm_final_verdict"] = verdict
             df.loc[idx, "llm_final_confidence"] = confidence
-            df.loc[idx, "llm_final_reasoning"] = reasoning
-            df.loc[idx, "llm_final_actions"] = "; ".join(actions)
+            df.loc[idx, "llm_final_problem"] = problem
+            df.loc[idx, "llm_final_cause"] = cause
+            df.loc[idx, "llm_final_opportunity"] = opportunity
+            df.loc[idx, "llm_final_evidence"] = evidence
+            df.loc[idx, "llm_final_reasoning_raw"] = json.dumps(reasoning) if reasoning else ""
+            df.loc[idx, "llm_final_actions"] = " | ".join(actions) if actions else ""
             df.loc[idx, "llm_final_risk_flags"] = "; ".join(risk_flags)
 
             time.sleep(SLEEP)
@@ -137,9 +180,9 @@ def run_llm_stage_2():
             df.loc[idx, "llm_stage_2_status"] = "error"
             df.loc[idx, "llm_final_verdict"] = "monitor"
             df.loc[idx, "llm_final_confidence"] = "low"
-            df.loc[idx, "llm_final_reasoning"] = f"llm_error:{str(e)}"
+            df.loc[idx, "llm_final_reasoning_raw"] = f"llm_error:{str(e)}"
             df.loc[idx, "llm_final_risk_flags"] = "llm_error"
 
     out_path = os.path.join(OUTPUT_DIR, "final_output.csv")
     df.to_csv(out_path, index=False)
-    print(f"✔ LLM Stage 2 V2 final output saved → {out_path}")
+    print(f"✓ LLM Stage 2 V3 final output saved → {out_path}")
