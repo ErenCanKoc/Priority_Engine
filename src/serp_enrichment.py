@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 from serpapi.google_search import GoogleSearch
 from config import OUTPUT_DIR, SERPAPI_KEY, SERP_LIMIT
+from observability import log, track_stage, Metrics
 
 
 # -----------------------
@@ -52,10 +53,11 @@ def _parse_serp(result: dict, target_url: str):
             rank = i
             break
 
-    # very rough competition heuristic
     ads_present = bool(result.get("ads"))
     heavy_features = len(features) >= 2
-    competition_level = "high" if ads_present or heavy_features else "medium" if features else "low"
+    competition_level = (
+        "high" if ads_present or heavy_features else "medium" if features else "low"
+    )
 
     return {
         "serp_features": ",".join(sorted(features)),
@@ -68,68 +70,77 @@ def _parse_serp(result: dict, target_url: str):
 # Main runner (V2 Contract)
 # -----------------------
 def run_serp():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    in_path = os.path.join(OUTPUT_DIR, "engine_output.csv")
-    df = pd.read_csv(in_path)
+    with track_stage("serp"):
+        metrics = Metrics("serp")
 
-    # Ensure columns exist (explicit contract)
-    for c in [
-        "serp_status",
-        "serp_features",
-        "serp_rank",
-        "serp_competition",
-        "serp_error",
-        "serp_summary",
-    ]:
-        if c not in df.columns:
-            df[c] = ""
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        in_path = os.path.join(OUTPUT_DIR, "engine_output.csv")
+        df = pd.read_csv(in_path)
 
-    # Default states
-    df["serp_status"] = "skipped"
-    df["serp_features"] = ""
-    df["serp_rank"] = np.nan
-    df["serp_competition"] = ""
-    df["serp_error"] = ""
-    df["serp_summary"] = ""
+        # Ensure columns exist (explicit contract)
+        for c in [
+            "serp_status",
+            "serp_features",
+            "serp_rank",
+            "serp_competition",
+            "serp_error",
+            "serp_summary",
+        ]:
+            if c not in df.columns:
+                df[c] = ""
 
-    # Candidates are defined ONLY by engine contract
-    candidates = df[df.get("analyze_candidate", False) == True].copy()
+        # Default states
+        df["serp_status"] = "skipped"
+        df["serp_features"] = ""
+        df["serp_rank"] = np.nan
+        df["serp_competition"] = ""
+        df["serp_error"] = ""
+        df["serp_summary"] = ""
 
-    # Optional cap (cost control)
-    if SERP_LIMIT and SERP_LIMIT > 0:
-        candidates = candidates.head(SERP_LIMIT)
+        # Candidates are defined ONLY by engine contract
+        candidates = df[df.get("analyze_candidate", False) == True].copy()
 
-    for idx, r in candidates.iterrows():
-        try:
-            query = str(r.get("keyword", "")).strip()
-            url = str(r.get("url", "")).strip()
+        # Optional cap (cost control)
+        if SERP_LIMIT and SERP_LIMIT > 0:
+            candidates = candidates.head(SERP_LIMIT)
 
-            if not query:
-                raise RuntimeError("empty_query")
+        for idx, r in candidates.iterrows():
+            metrics.inc_total()
+            try:
+                query = str(r.get("keyword", "")).strip()
+                url = str(r.get("url", "")).strip()
 
-            serp = _fetch_serp_de(query)
-            parsed = _parse_serp(serp, url)
+                if not query:
+                    raise RuntimeError("empty_query")
 
-            df.loc[idx, "serp_status"] = "ok"
-            df.loc[idx, "serp_features"] = parsed["serp_features"]
-            df.loc[idx, "serp_rank"] = parsed["serp_rank"]
-            df.loc[idx, "serp_competition"] = parsed["serp_competition"]
-            df.loc[idx, "serp_summary"] = (
-                f"features={parsed['serp_features']}; "
-                f"rank={parsed['serp_rank']}; "
-                f"competition={parsed['serp_competition']}"
-            )
+                serp = _fetch_serp_de(query)
+                parsed = _parse_serp(serp, url)
 
-            time.sleep(1.0)  # be gentle to API
+                df.loc[idx, "serp_status"] = "ok"
+                df.loc[idx, "serp_features"] = parsed["serp_features"]
+                df.loc[idx, "serp_rank"] = parsed["serp_rank"]
+                df.loc[idx, "serp_competition"] = parsed["serp_competition"]
+                df.loc[idx, "serp_summary"] = (
+                    f"features={parsed['serp_features']}; "
+                    f"rank={parsed['serp_rank']}; "
+                    f"competition={parsed['serp_competition']}"
+                )
 
-        except Exception as e:
-            df.loc[idx, "serp_status"] = "error"
-            df.loc[idx, "serp_error"] = str(e)
-            df.loc[idx, "serp_summary"] = f"serp_error:{str(e)}"
+                metrics.inc_success()
+                time.sleep(1.0)
 
-    # Convenience boolean for downstream (LLM)
-    df["serp_data_available"] = df["serp_status"] == "ok"
+            except Exception as e:
+                df.loc[idx, "serp_status"] = "error"
+                df.loc[idx, "serp_error"] = str(e)
+                df.loc[idx, "serp_summary"] = f"serp_error:{str(e)}"
+                metrics.inc_failed()
 
-    out_path = os.path.join(OUTPUT_DIR, "serp_output.csv")
-    df.to_csv(out_path, index=False)
-    print(f"✔ SERP V2 output saved → {out_path}")
+        # Emit metrics ONCE per stage
+        metrics.emit()
+
+        # Convenience boolean for downstream (LLM)
+        df["serp_data_available"] = df["serp_status"] == "ok"
+
+        out_path = os.path.join(OUTPUT_DIR, "serp_output.csv")
+        df.to_csv(out_path, index=False)
+        print(f"✔ SERP V2 output saved → {out_path}")
