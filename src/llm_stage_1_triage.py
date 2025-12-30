@@ -8,7 +8,7 @@ from openai import OpenAI
 from config import OUTPUT_DIR, OPENAI_API_KEY, LLM_MAX_ITEMS
 from llm_prompts import TRIAGE_SYSTEM_PROMPT
 
-MODEL_STAGE_1 = "gpt-4.1-mini"
+MODEL_STAGE_1 = "gpt-4o-mini"
 TEMPERATURE = 0.2
 SLEEP = 0.4
 
@@ -51,19 +51,23 @@ SERP error: {r.get('serp_error','')}
 
 
 # -----------------------
-# Main runner (V2)
+# Main runner (V3)
 # -----------------------
 def run_llm_stage_1():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     in_path = os.path.join(OUTPUT_DIR, "serp_output.csv")
     df = pd.read_csv(in_path)
 
-    # Guarantee output columns
+    # Guarantee output columns (structured reasoning fields)
     for c in [
         "llm_stage_1_status",
         "llm_stage_1_verdict",
         "llm_stage_1_confidence",
-        "llm_stage_1_reasoning",
+        "llm_stage_1_problem",
+        "llm_stage_1_cause",
+        "llm_stage_1_opportunity",
+        "llm_stage_1_evidence",
+        "llm_stage_1_reasoning_raw",  # backup: full reasoning as JSON string
         "llm_stage_1_risk_flags",
     ]:
         if c not in df.columns:
@@ -73,7 +77,11 @@ def run_llm_stage_1():
     df["llm_stage_1_status"] = "skipped"
     df["llm_stage_1_verdict"] = "ignore"
     df["llm_stage_1_confidence"] = "low"
-    df["llm_stage_1_reasoning"] = ""
+    df["llm_stage_1_problem"] = ""
+    df["llm_stage_1_cause"] = ""
+    df["llm_stage_1_opportunity"] = ""
+    df["llm_stage_1_evidence"] = ""
+    df["llm_stage_1_reasoning_raw"] = ""
     df["llm_stage_1_risk_flags"] = ""
 
     # Gate: only analyze_candidate=True goes to LLM
@@ -105,15 +113,35 @@ def run_llm_stage_1():
                 df.loc[idx, "llm_stage_1_status"] = "error"
                 df.loc[idx, "llm_stage_1_verdict"] = "monitor"
                 df.loc[idx, "llm_stage_1_confidence"] = "low"
-                df.loc[idx, "llm_stage_1_reasoning"] = raw[:500]
+                df.loc[idx, "llm_stage_1_reasoning_raw"] = raw[:500]
                 df.loc[idx, "llm_stage_1_risk_flags"] = "json_parse_failed"
                 time.sleep(SLEEP)
                 continue
 
             verdict = parsed.get("verdict", "monitor")
             confidence = parsed.get("confidence", "low")
-            reasoning = parsed.get("reasoning", "")
+            reasoning = parsed.get("reasoning", {})
             risk_flags = parsed.get("risk_flags", [])
+
+            # Parse structured reasoning (with fallbacks)
+            if isinstance(reasoning, dict):
+                problem = reasoning.get("problem", "")
+                cause = reasoning.get("cause", "")
+                opportunity = reasoning.get("opportunity", "")
+                evidence = reasoning.get("evidence", "")
+            elif isinstance(reasoning, str):
+                # Fallback: LLM returned string instead of dict
+                problem = reasoning[:200]
+                cause = ""
+                opportunity = ""
+                evidence = ""
+                risk_flags = list(set(risk_flags + ["reasoning_format_error"]))
+            else:
+                problem = ""
+                cause = ""
+                opportunity = ""
+                evidence = ""
+                risk_flags = list(set(risk_flags + ["reasoning_missing"]))
 
             # Enforce SERP-aware confidence (contract)
             if r.get("serp_status") != "ok":
@@ -123,7 +151,11 @@ def run_llm_stage_1():
             df.loc[idx, "llm_stage_1_status"] = "ok"
             df.loc[idx, "llm_stage_1_verdict"] = verdict
             df.loc[idx, "llm_stage_1_confidence"] = confidence
-            df.loc[idx, "llm_stage_1_reasoning"] = reasoning
+            df.loc[idx, "llm_stage_1_problem"] = problem
+            df.loc[idx, "llm_stage_1_cause"] = cause
+            df.loc[idx, "llm_stage_1_opportunity"] = opportunity
+            df.loc[idx, "llm_stage_1_evidence"] = evidence
+            df.loc[idx, "llm_stage_1_reasoning_raw"] = json.dumps(reasoning) if reasoning else ""
             df.loc[idx, "llm_stage_1_risk_flags"] = "; ".join(risk_flags)
 
             time.sleep(SLEEP)
@@ -132,9 +164,9 @@ def run_llm_stage_1():
             df.loc[idx, "llm_stage_1_status"] = "error"
             df.loc[idx, "llm_stage_1_verdict"] = "monitor"
             df.loc[idx, "llm_stage_1_confidence"] = "low"
-            df.loc[idx, "llm_stage_1_reasoning"] = f"llm_error:{str(e)}"
+            df.loc[idx, "llm_stage_1_reasoning_raw"] = f"llm_error:{str(e)}"
             df.loc[idx, "llm_stage_1_risk_flags"] = "llm_error"
 
     out_path = os.path.join(OUTPUT_DIR, "llm_stage_1_output.csv")
     df.to_csv(out_path, index=False)
-    print(f"✔ LLM Stage 1 V2 output saved → {out_path}")
+    print(f"✓ LLM Stage 1 V3 output saved → {out_path}")
