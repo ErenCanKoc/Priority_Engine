@@ -205,7 +205,7 @@ def run_engine():
     eligible = ~hard_exclude
 
     # Thresholds you can tune
-    MIN_MSV_FOR_ACTION = 300
+    MIN_MSV_FOR_ACTION = 100
     MIN_GAP_FOR_ACTION = 30  # clicks opportunity
     PCTL = float(ACTION_PERCENTILE)
 
@@ -259,3 +259,4 @@ def run_engine():
     out_path = os.path.join(OUTPUT_DIR, "engine_output.csv")
     df.to_csv(out_path, index=False)
     print(f"✔ Engine V2 output saved → {out_path}")
+
