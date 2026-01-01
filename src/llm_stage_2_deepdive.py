@@ -10,14 +10,24 @@ from tqdm import tqdm
 
 from config import OUTPUT_DIR, OPENAI_API_KEY
 from llm_prompts import DEEPDIVE_SYSTEM_PROMPT
+from retry_utils import retry_call, RetryConfig, RetryStats
 
 MODEL_STAGE_2 = "gpt-4o-mini"
 TEMPERATURE = 0.2
 SLEEP = 0.9
 
+# Stage 2 daha kritik, daha toleranslı retry
+LLM_RETRY_CONFIG = RetryConfig(
+    max_retries=5,
+    base_delay=2.0,
+    max_delay=120.0,
+    exponential_base=2.0,
+    jitter=True
+)
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Setup logging
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -29,9 +39,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# -----------------------
-# Metrics tracking
-# -----------------------
 class Stage2Metrics:
     def __init__(self):
         self.start_time = datetime.now()
@@ -45,18 +52,21 @@ class Stage2Metrics:
         self.total_tokens_output = 0
         self.total_cost = 0.0
         
-        # Verdict breakdown
         self.verdict_counts = {"action": 0, "monitor": 0, "ignore": 0}
         self.confidence_counts = {"high": 0, "medium": 0, "low": 0}
         self.generic_action_count = 0
         
-        # Timing
         self.total_api_time = 0.0
         self.avg_api_time = 0.0
         
-    def record_success(self, verdict, confidence, tokens_in, tokens_out, api_time, has_generic_actions):
+        # Retry tracking
+        self.total_retries = 0
+        self.retry_stats = RetryStats()
+        
+    def record_success(self, verdict, confidence, tokens_in, tokens_out, api_time, has_generic_actions, retries=0):
         self.success_count += 1
         self.processed_rows += 1
+        self.total_retries += retries
         
         if verdict in self.verdict_counts:
             self.verdict_counts[verdict] += 1
@@ -68,12 +78,12 @@ class Stage2Metrics:
             
         self.total_tokens_input += tokens_in
         self.total_tokens_output += tokens_out
-        
-        # GPT-4o-mini pricing: $0.15/1M input, $0.60/1M output
         self.total_cost += (tokens_in * 0.15 / 1_000_000) + (tokens_out * 0.60 / 1_000_000)
         
         self.total_api_time += api_time
         self.avg_api_time = self.total_api_time / self.success_count
+        
+        self.retry_stats.record_success(retries)
         
     def record_error(self, error_type):
         self.error_count += 1
@@ -83,6 +93,8 @@ class Stage2Metrics:
             self.json_parse_errors += 1
         elif error_type == "api":
             self.api_errors += 1
+        
+        self.retry_stats.record_failure(error_type)
     
     def get_summary(self):
         elapsed = (datetime.now() - self.start_time).total_seconds()
@@ -97,6 +109,9 @@ class Stage2Metrics:
             "json_parse_errors": self.json_parse_errors,
             "api_errors": self.api_errors,
             "generic_action_warnings": self.generic_action_count,
+            
+            "total_retries": self.total_retries,
+            "avg_retries_per_success": f"{self.total_retries / max(self.success_count, 1):.2f}",
             
             "verdict_action": self.verdict_counts["action"],
             "verdict_monitor": self.verdict_counts["monitor"],
@@ -123,13 +138,9 @@ class Stage2Metrics:
         for key, value in summary.items():
             logger.info(f"{key:30s}: {value}")
         logger.info("=" * 80)
-        
         return summary
 
 
-# -----------------------
-# Build LLM input (deep)
-# -----------------------
 def _build_user_input(r):
     return f"""
 URL: {r.get('url','')}
@@ -167,9 +178,39 @@ SERP error: {r.get('serp_error','')}
 """.strip()
 
 
-# -----------------------
-# Column mapping & export helpers
-# -----------------------
+def _call_llm_with_retry(user_input: str) -> tuple:
+    """
+    LLM'i retry logic ile çağırır.
+    Returns: (response, retries_used, api_time)
+    """
+    retries_used = 0
+    
+    def on_retry(attempt, exception, delay):
+        nonlocal retries_used
+        retries_used = attempt + 1
+        logger.warning(f"LLM Stage 2 retry #{attempt + 1}: {type(exception).__name__}")
+    
+    api_start = time.time()
+    
+    resp = retry_call(
+        client.chat.completions.create,
+        kwargs={
+            "model": MODEL_STAGE_2,
+            "messages": [
+                {"role": "system", "content": DEEPDIVE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_input},
+            ],
+            "temperature": TEMPERATURE,
+        },
+        config=LLM_RETRY_CONFIG,
+        on_retry=on_retry,
+    )
+    
+    api_time = time.time() - api_start
+    return resp, retries_used, api_time
+
+
+# Column mapping & export helpers (değişmedi)
 COLUMN_MAPPING = {
     "keyword": "Search_Term",
     "url": "Page_URL",
@@ -224,21 +265,11 @@ COLUMN_MAPPING = {
 }
 
 ESSENTIAL_COLUMNS = [
-    "Search_Term",
-    "Page_URL",
-    "Opportunity_Category",
-    "Final_Recommendation",
-    "Confidence_Level",
-    "Core_Problem",
-    "Root_Cause",
-    "Potential_Gain",
-    "Action_Items",
-    "Current_Clicks",
-    "Missing_Clicks_Per_Month",
-    "Monthly_Search_Volume",
-    "Average_Rank_Position",
-    "Google_Features_Present",
-    "Competition_Level",
+    "Search_Term", "Page_URL", "Opportunity_Category",
+    "Final_Recommendation", "Confidence_Level", "Core_Problem",
+    "Root_Cause", "Potential_Gain", "Action_Items",
+    "Current_Clicks", "Missing_Clicks_Per_Month", "Monthly_Search_Volume",
+    "Average_Rank_Position", "Google_Features_Present", "Competition_Level",
     "Risk_Flags",
 ]
 
@@ -246,22 +277,18 @@ ESSENTIAL_COLUMNS = [
 def export_readable_versions(df, output_dir):
     """Export 3 versions: full technical, full readable, essential only"""
     
-    # 1. Full technical (original column names, for debugging)
     full_tech_path = os.path.join(output_dir, "final_output_full_technical.csv")
     df.to_csv(full_tech_path, index=False)
     logger.info(f"Saved full technical output → {full_tech_path}")
     
-    # 2. Full readable (all columns with human names)
     df_readable = df.rename(columns=COLUMN_MAPPING)
     full_readable_path = os.path.join(output_dir, "final_output_full_readable.csv")
     df_readable.to_csv(full_readable_path, index=False)
     logger.info(f"Saved full readable output → {full_readable_path}")
     
-    # 3. Essential only (what localization team needs)
     available_cols = [c for c in ESSENTIAL_COLUMNS if c in df_readable.columns]
     df_essential = df_readable[available_cols].copy()
     
-    # Sort: action first, high confidence first
     if "Final_Recommendation" in df_essential.columns:
         priority_map = {"action": 1, "monitor": 2, "ignore": 3}
         confidence_map = {"high": 1, "medium": 2, "low": 3}
@@ -277,12 +304,8 @@ def export_readable_versions(df, output_dir):
     return full_tech_path, full_readable_path, essential_path
 
 
-# -----------------------
-# Main runner (V4 - with observability)
-# -----------------------
 def run_llm_stage_2():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    logger.info("Starting LLM Stage 2 - Deep Dive")
+    logger.info("Starting LLM Stage 2 - Deep Dive (with retry)")
     
     metrics = Stage2Metrics()
     
@@ -291,35 +314,20 @@ def run_llm_stage_2():
     
     logger.info(f"Loaded {len(df)} rows from {in_path}")
 
-    # Guarantee output columns (structured reasoning + actions)
     for c in [
-        "llm_stage_2_status",
-        "llm_final_verdict",
-        "llm_final_confidence",
-        "llm_final_problem",
-        "llm_final_cause",
-        "llm_final_opportunity",
-        "llm_final_evidence",
-        "llm_final_reasoning_raw",
-        "llm_final_actions",
-        "llm_final_risk_flags",
+        "llm_stage_2_status", "llm_final_verdict", "llm_final_confidence",
+        "llm_final_problem", "llm_final_cause", "llm_final_opportunity",
+        "llm_final_evidence", "llm_final_reasoning_raw", "llm_final_actions",
+        "llm_final_risk_flags", "llm_stage_2_retries",
     ]:
         if c not in df.columns:
             df[c] = ""
 
-    # Defaults
     df["llm_stage_2_status"] = "skipped"
     df["llm_final_verdict"] = "monitor"
     df["llm_final_confidence"] = "low"
-    df["llm_final_problem"] = ""
-    df["llm_final_cause"] = ""
-    df["llm_final_opportunity"] = ""
-    df["llm_final_evidence"] = ""
-    df["llm_final_reasoning_raw"] = ""
-    df["llm_final_actions"] = ""
-    df["llm_final_risk_flags"] = ""
+    df["llm_stage_2_retries"] = 0
 
-    # Gate: only rows explicitly marked as action
     stage2 = df[df["llm_stage_1_verdict"] == "action"].copy()
     logger.info(f"Found {len(stage2)} rows requiring deep dive analysis")
     
@@ -330,27 +338,15 @@ def run_llm_stage_2():
         export_readable_versions(df, OUTPUT_DIR)
         return
 
-    # Progress bar
     with tqdm(total=len(stage2), desc="LLM Stage 2 Progress", unit="row") as pbar:
         for idx, r in stage2.iterrows():
             try:
                 user_input = _build_user_input(r)
                 
-                # Track API call time
-                api_start = time.time()
-                resp = client.chat.completions.create(
-                    model=MODEL_STAGE_2,
-                    messages=[
-                        {"role": "system", "content": DEEPDIVE_SYSTEM_PROMPT},
-                        {"role": "user", "content": user_input},
-                    ],
-                    temperature=TEMPERATURE,
-                )
-                api_time = time.time() - api_start
+                # Retry ile LLM çağrısı
+                resp, retries_used, api_time = _call_llm_with_retry(user_input)
 
                 raw = resp.choices[0].message.content.strip()
-                
-                # Extract token usage
                 tokens_in = resp.usage.prompt_tokens if resp.usage else 0
                 tokens_out = resp.usage.completion_tokens if resp.usage else 0
 
@@ -365,6 +361,7 @@ def run_llm_stage_2():
                     df.loc[idx, "llm_final_confidence"] = "low"
                     df.loc[idx, "llm_final_reasoning_raw"] = raw[:1000]
                     df.loc[idx, "llm_final_risk_flags"] = "json_parse_failed"
+                    df.loc[idx, "llm_stage_2_retries"] = retries_used
                     time.sleep(SLEEP)
                     pbar.update(1)
                     continue
@@ -375,7 +372,6 @@ def run_llm_stage_2():
                 actions = parsed.get("recommended_actions", [])
                 risk_flags = parsed.get("risk_flags", [])
 
-                # Parse structured reasoning
                 if isinstance(reasoning, dict):
                     problem = reasoning.get("problem", "")
                     cause = reasoning.get("cause", "")
@@ -383,25 +379,19 @@ def run_llm_stage_2():
                     evidence = reasoning.get("evidence", "")
                 elif isinstance(reasoning, str):
                     problem = reasoning[:200]
-                    cause = ""
-                    opportunity = ""
-                    evidence = ""
+                    cause, opportunity, evidence = "", "", ""
                     risk_flags = list(set(risk_flags + ["reasoning_format_error"]))
                 else:
-                    problem = ""
-                    cause = ""
-                    opportunity = ""
-                    evidence = ""
+                    problem, cause, opportunity, evidence = "", "", "", ""
                     risk_flags = list(set(risk_flags + ["reasoning_missing"]))
 
-                # Enforce risk flags
                 if r.get("serp_status") != "ok":
                     risk_flags = list(set(risk_flags + ["serp_unavailable"]))
 
                 if r.get("llm_stage_1_confidence") == "low":
                     risk_flags = list(set(risk_flags + ["low_upstream_confidence"]))
 
-                # Validate actions specificity
+                # Generic actions check
                 has_generic_actions = False
                 generic_phrases = ["improve content", "optimize title", "build links", "add keywords"]
                 if actions:
@@ -422,35 +412,35 @@ def run_llm_stage_2():
                 df.loc[idx, "llm_final_reasoning_raw"] = json.dumps(reasoning) if reasoning else ""
                 df.loc[idx, "llm_final_actions"] = " | ".join(actions) if actions else ""
                 df.loc[idx, "llm_final_risk_flags"] = "; ".join(risk_flags)
+                df.loc[idx, "llm_stage_2_retries"] = retries_used
                 
-                # Record success metrics
-                metrics.record_success(verdict, confidence, tokens_in, tokens_out, api_time, has_generic_actions)
+                metrics.record_success(verdict, confidence, tokens_in, tokens_out, api_time, has_generic_actions, retries_used)
                 
-                # Log every 50 rows (stage 2 is slower)
                 if metrics.processed_rows % 50 == 0:
-                    logger.info(f"Progress: {metrics.processed_rows}/{metrics.total_rows} | "
-                              f"Success rate: {(metrics.success_count/metrics.processed_rows)*100:.1f}% | "
-                              f"Avg API time: {metrics.avg_api_time:.2f}s")
+                    logger.info(
+                        f"Progress: {metrics.processed_rows}/{metrics.total_rows} | "
+                        f"Success: {(metrics.success_count/metrics.processed_rows)*100:.1f}% | "
+                        f"Retries: {metrics.total_retries}"
+                    )
 
                 time.sleep(SLEEP)
                 pbar.update(1)
 
             except Exception as e:
-                logger.error(f"Row {idx}: API error - {str(e)}")
+                logger.error(f"Row {idx}: Final failure after retries - {str(e)}")
                 metrics.record_error("api")
                 
                 df.loc[idx, "llm_stage_2_status"] = "error"
                 df.loc[idx, "llm_final_verdict"] = "monitor"
                 df.loc[idx, "llm_final_confidence"] = "low"
                 df.loc[idx, "llm_final_reasoning_raw"] = f"llm_error:{str(e)}"
-                df.loc[idx, "llm_final_risk_flags"] = "llm_error"
+                df.loc[idx, "llm_final_risk_flags"] = "llm_error_after_retries"
+                df.loc[idx, "llm_stage_2_retries"] = LLM_RETRY_CONFIG.max_retries
                 
                 pbar.update(1)
 
-    # Export 3 versions
     tech_path, readable_path, team_path = export_readable_versions(df, OUTPUT_DIR)
     
-    # Log and save metrics
     summary = metrics.log_summary()
     
     metrics_path = os.path.join(OUTPUT_DIR, "llm_stage_2_metrics.json")
@@ -462,6 +452,7 @@ def run_llm_stage_2():
     print(f"  Processed: {metrics.processed_rows}/{metrics.total_rows}")
     print(f"  Success: {metrics.success_count} ({summary['success_rate']})")
     print(f"  Errors: {metrics.error_count}")
+    print(f"  Total retries: {metrics.total_retries}")
     print(f"  Generic actions flagged: {metrics.generic_action_count}")
     print(f"  Cost: {summary['total_cost_usd']}")
     print(f"  Time: {summary['total_time_seconds']}s")
